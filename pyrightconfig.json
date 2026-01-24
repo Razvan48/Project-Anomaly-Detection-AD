@@ -1,0 +1,20 @@
+{
+    "executionEnvironments": [
+        {
+            "root": ".",
+            "pythonVersion": "3.12.3",
+            "venvPath": ".",
+            "venv": ".venv" 
+        }
+    ],
+    "include": [
+        "src",
+        "notebooks"
+    ],
+    "exclude": [],
+    "typeCheckingMode": "strict",
+    "pythonPlatform": "All",
+    "reportMissingImports": true,
+    "reportUnusedImport": "warning",
+    "reportGeneralTypeIssues": "error"
+}
