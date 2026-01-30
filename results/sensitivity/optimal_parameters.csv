@@ -1,0 +1,6 @@
+Parameter,Recommended Value,Rationale,Trade-off
+Contamination,0.08 (or match true rate),Best average performance across datasets,Should match expected anomaly rate in data
+Ensemble Size,100,Good accuracy with reasonable training time,Larger = better accuracy but slower training
+Subsample Size,256,Standard value with good performance/speed balance,"Larger = more info but slower, smaller = faster but less stable"
+n_jobs,-1 (use all cores),Significant speedup (3-8x) with no accuracy loss,None (always beneficial for ensemble_size > 10)
+random_state,"Fixed integer (e.g., 42)",Ensures reproducible results,None (always recommended for experiments)
