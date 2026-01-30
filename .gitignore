@@ -5,6 +5,9 @@ __pycache__/
 *.so
 .Python
 
+# Ruff cache
+.ruff_cache/
+
 # Virtual environments
 .venv/
 venv/
@@ -40,3 +43,7 @@ Thumbs.db
 # Project specific
 *.log
 .pyright/
+test-cases/
+
+# Linter
+pyproject.toml
