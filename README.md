@@ -10,7 +10,6 @@
 
 <br/>
 <br/>
-<br/>
 
 # TODO:
 
@@ -37,3 +36,4 @@ try other github implementations (also for kmeans tree and ensemble)
 
 - [ ] conclusions + future improvements
 
+<br/>
