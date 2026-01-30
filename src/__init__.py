@@ -5,8 +5,7 @@ This package provides implementations of Isolation Forest algorithms for anomaly
 - kmeans_isolation: K-Means-based Isolation Forest using cluster-based partitioning
 """
 
-from . import isolation
-from . import kmeans_isolation
+from . import isolation, kmeans_isolation
 
 __all__ = [
     "isolation",

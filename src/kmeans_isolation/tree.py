@@ -12,22 +12,19 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 
 
 def find_optimal_kmeans(
     Xs: npt.NDArray[np.floating[Any]]
-) -> tuple[int, KMeans]:
-    """Find the optimal number of clusters using the elbow method.
-    
-    Tests k values of [2, 3, 5, 7] and selects the one with maximum distance
-    from the line connecting the first and last inertia values.
-    
+) -> tuple[int, MiniBatchKMeans]:
+    """
+    Find the optimal number of clusters using the elbow method.
+    Uses MiniBatchKMeans for better performance on larger datasets.
     Args:
         Xs: Data samples of shape (n_samples, n_features).
-        
     Returns:
-        Tuple of (optimal_k, fitted_kmeans_model).
+        Tuple of (optimal_k, fitted_MiniBatchKMeans_model).
     """
     initial_Ks = [2, 3, 5, 7]
     Ks = [k for k in initial_Ks if k <= Xs.shape[0]]
@@ -36,7 +33,8 @@ def find_optimal_kmeans(
     inertias = []
 
     for k in Ks:
-        kmeans = KMeans(n_clusters=k, random_state=23)
+        batch_size = min(100, Xs.shape[0])
+        kmeans = MiniBatchKMeans(n_clusters=k, random_state=23, batch_size=batch_size)
         kmeans.fit(Xs)
 
         kmeans_list.append(kmeans)
@@ -64,11 +62,8 @@ def find_optimal_kmeans(
 
 
 class KMeansIsolationTreeNode:
-    """Node in a K-Means-based Isolation Tree that partitions using clustering.
-    
-    Unlike standard isolation trees that use binary splits, this node uses K-Means
-    clustering to create multiple splits (2-7 children) based on cluster centers.
-    
+    """
+    Node in a K-Means-based Isolation Tree that partitions using clustering.
     Attributes:
         depth: Current depth of the node in the tree (root is 0).
         feature_limits: List of [min, max] boundaries for each feature dimension.
@@ -81,8 +76,8 @@ class KMeansIsolationTreeNode:
     """
     
     def __init__(self, depth: int, feature_limits: list[list[float]]) -> None:
-        """Initialize a KMeansIsolationTreeNode.
-        
+        """
+        Initialize a KMeansIsolationTreeNode.
         Args:
             depth: Depth of this node in the tree.
             feature_limits: Boundaries for each feature dimension [[min1, max1], [min2, max2], ...].
@@ -99,12 +94,11 @@ class KMeansIsolationTreeNode:
         self.data: npt.NDArray[np.floating[Any]] | None = None
 
     def partition_space(
-        self, 
-        Xs: npt.NDArray[np.floating[Any]], 
+        self,
+        Xs: npt.NDArray[np.floating[Any]],
         MAX_DEPTH: int
     ) -> None:
-        """Recursively partition the feature space using K-Means clustering.
-        
+        """
         Creates a multi-way tree by randomly selecting a feature, clustering
         the projected data, and creating splits between cluster centers.
         
@@ -121,17 +115,40 @@ class KMeansIsolationTreeNode:
 
         _, kmeans = find_optimal_kmeans(Xs_projected.reshape(-1, 1))
 
-        self.cluster_centers = sorted(kmeans.cluster_centers_.flatten().tolist())
+        # Recalculate cluster centers based on actual assigned labels
+        # MiniBatchKMeans can have centers that don't match the mean of assigned points
+        # due to incremental mini-batch updates, which causes issues with radius calculation
+
+        labels = kmeans.labels_
+        recalculated_centers = []
+        for cluster_idx in range(kmeans.n_clusters):
+            cluster_mask = labels == cluster_idx
+            if np.any(cluster_mask):
+                cluster_mean = float(np.mean(Xs_projected[cluster_mask]))
+                recalculated_centers.append(cluster_mean)
+            else:
+                recalculated_centers.append(float(kmeans.cluster_centers_[cluster_idx, 0]))
+
+        self.cluster_centers = sorted(recalculated_centers)
         self.split_thresholds = []
         for idx in range(1, len(self.cluster_centers)):
             split_threshold = (self.cluster_centers[idx - 1] + self.cluster_centers[idx]) / 2.0
             self.split_thresholds.append(split_threshold)
-        self.cluster_radii = [0.0 for _ in range(len(self.cluster_centers))]
-        for X_projected in Xs_projected:
-            cluster_distances = [np.abs(X_projected - cluster_center) for cluster_center in self.cluster_centers]
-            closest_cluster_idx = int(np.argmin(cluster_distances))
-            if cluster_distances[closest_cluster_idx] > self.cluster_radii[closest_cluster_idx]:
-                self.cluster_radii[closest_cluster_idx] = cluster_distances[closest_cluster_idx]
+        
+        cluster_centers_array = np.array(self.cluster_centers).reshape(1, -1)  # (1, n_clusters)
+        Xs_projected_reshaped = Xs_projected.reshape(-1, 1)  # (n_samples, 1)
+        distances = np.abs(Xs_projected_reshaped - cluster_centers_array)  # (n_samples, n_clusters)
+        closest_clusters = np.argmin(distances, axis=1)  # (n_samples,)
+
+        # For each cluster, find max distance from any point assigned to it
+        self.cluster_radii = []
+        for cluster_idx in range(len(self.cluster_centers)):
+            mask = closest_clusters == cluster_idx
+            if np.any(mask):
+                max_dist = np.max(distances[mask, cluster_idx])
+                self.cluster_radii.append(float(max_dist))
+            else:
+                self.cluster_radii.append(0.0)
 
         self.children = []
         for idx in range(len(self.split_thresholds)):
@@ -176,12 +193,111 @@ class KMeansIsolationTreeNode:
         self.children.append(child)
         self.children[-1].partition_space(Xs_between, MAX_DEPTH)
 
-    def get_path_length(self, X: npt.NDArray[np.floating[Any]]) -> float:
-        """Calculate the path length from root to the node containing X.
+    def get_path_lengths_batch(self, Xs: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.floating[Any]]:
+        """
+        Args:
+            Xs: Data samples of shape (n_samples, n_features).
+        Returns:
+            Path lengths for each sample of shape (n_samples,).
+        """
+        n_samples = Xs.shape[0]
+        path_lengths = np.zeros(n_samples, dtype=np.float64)
         
+        if self.data is not None:
+            return path_lengths  # All zeros for leaf nodes
+        
+        assert self.idx_feature is not None
+        
+        X_projected = Xs[:, self.idx_feature]  # (n_samples,)
+        
+        for idx in range(len(self.split_thresholds)):
+            if idx == 0:
+                mask = X_projected < self.split_thresholds[idx]
+            else:
+                mask = (X_projected >= self.split_thresholds[idx-1]) & (X_projected < self.split_thresholds[idx])
+            
+            if np.any(mask):
+                path_lengths[mask] = 1 + self.children[idx].get_path_lengths_batch(Xs[mask])
+        
+        # Last child
+        mask = X_projected >= self.split_thresholds[-1]
+        if np.any(mask):
+            path_lengths[mask] = 1 + self.children[-1].get_path_lengths_batch(Xs[mask])
+        
+        return path_lengths
+
+    def get_normality_scores_batch(self, Xs: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.floating[Any]]:
+        """
+        Args:
+            Xs: Data samples of shape (n_samples, n_features).
+        Returns:
+            Normality scores for each sample of shape (n_samples,).
+        """
+        n_samples = Xs.shape[0]
+        
+        if self.data is not None:
+            return np.zeros(n_samples, dtype=np.float64)
+        
+        assert self.idx_feature is not None
+        
+        X_projected = Xs[:, self.idx_feature]  # (n_samples,)
+        
+        cluster_centers_array = np.array(self.cluster_centers).reshape(1, -1)
+        X_proj_reshaped = X_projected.reshape(-1, 1)
+        distances = np.abs(X_proj_reshaped - cluster_centers_array)  # (n_samples, n_clusters)
+        
+        # Find closest cluster for each sample
+        closest_cluster_indices = np.argmin(distances, axis=1)
+        
+        # Calculate normality scores vectorized
+        cluster_radii_array = np.array(self.cluster_radii)
+        closest_distances = distances[np.arange(n_samples), closest_cluster_indices]
+        closest_radii = cluster_radii_array[closest_cluster_indices]
+        
+        # Calculate normality scores vectorized
+        # Handle zero-radius case properly:
+        # - If radius=0 AND distance=0: normality = 1.0 (exact match to single-point cluster)
+        # - If radius=0 AND distance>0: normality = 0.0 (not at cluster center, outlier)
+        # - If radius>0: normality = 1.0 - (distance / radius), clamped to [0, 1]
+        normality_scores = np.zeros(n_samples, dtype=np.float64)
+        
+        # Handle zero-radius clusters
+        zero_radius_mask = closest_radii == 0.0
+        if np.any(zero_radius_mask):
+            # For zero-radius: normality = 1.0 only if distance is also zero
+            exact_match_mask = zero_radius_mask & (closest_distances == 0.0)
+            normality_scores[exact_match_mask] = 1.0
+            # Points not at center of zero-radius cluster get normality = 0.0 (already set)
+        
+        # Handle non-zero radius clusters
+        non_zero_mask = closest_radii != 0.0
+        if np.any(non_zero_mask):
+            normality_scores[non_zero_mask] = 1.0 - (closest_distances[non_zero_mask] / closest_radii[non_zero_mask])
+            normality_scores[non_zero_mask] = np.maximum(0.0, normality_scores[non_zero_mask])  # Clamp to [0, 1]
+        
+        # Recursively process children - vectorized routing
+        child_scores = np.zeros(n_samples, dtype=np.float64)
+        
+        for idx in range(len(self.split_thresholds)):
+            if idx == 0:
+                mask = X_projected < self.split_thresholds[idx]
+            else:
+                mask = (X_projected >= self.split_thresholds[idx-1]) & (X_projected < self.split_thresholds[idx])
+            
+            if np.any(mask):
+                child_scores[mask] = self.children[idx].get_normality_scores_batch(Xs[mask])
+        
+        # Last child
+        mask = X_projected >= self.split_thresholds[-1]
+        if np.any(mask):
+            child_scores[mask] = self.children[-1].get_normality_scores_batch(Xs[mask])
+        
+        return normality_scores + child_scores
+
+    def get_path_length(self, X: npt.NDArray[np.floating[Any]]) -> float:
+        """
         Args:
             X: Single data sample of shape (n_features,).
-            
         Returns:
             Path length to reach this sample.
         """
@@ -196,18 +312,16 @@ class KMeansIsolationTreeNode:
         return 1 + self.children[-1].get_path_length(X)
     
     def get_normality_score(self, X: npt.NDArray[np.floating[Any]]) -> float:
-        """Calculate the normality score based on distance to cluster centers.
-        
+        """
         Computes cumulative normality score based on how close the sample is
         to cluster centers at each level. Score is inversely proportional to
         distance from cluster center normalized by cluster radius.
-        
         Args:
             X: Single data sample of shape (n_features,).
-            
         Returns:
             Cumulative normality score (higher = more normal).
         """
+
         if self.data is not None:
             return 0.0
 
@@ -220,8 +334,6 @@ class KMeansIsolationTreeNode:
         cluster_radius = self.cluster_radii[closest_cluster_idx]
 
         if cluster_radius == 0.0:
-            # TODO: if X is exactly center of cluster, then normality is 1.0, else is 0.0
-            # TODO: change sub sampling size from 256 to 128
             normality_score = 1.0
         else:
             normality_score = 1.0 - (cluster_distances[closest_cluster_idx] / cluster_radius)
@@ -233,8 +345,7 @@ class KMeansIsolationTreeNode:
         return normality_score + self.children[-1].get_normality_score(X)
     
     def plot_partition_space_2D(self) -> None:
-        """Visualize the 2D space partitioning created by this node and its children.
-        
+        """
         Plots vertical/horizontal lines for each split and scatters points in leaf nodes.
         Only works for 2-dimensional data.
         """
@@ -257,11 +368,8 @@ class KMeansIsolationTreeNode:
 
 
 class KMeansIsolationTree:
-    """Single K-Means-based Isolation Tree for anomaly detection.
-    
-    Similar to IsolationTree but uses K-Means clustering for splits instead of
-    random thresholds. Provides both path-length and normality-based scoring.
-    
+    """
+    Single K-Means-based Isolation Tree for anomaly detection.
     Attributes:
         feature_limits: Boundaries for each feature dimension.
         root: Root node of the tree.
@@ -281,17 +389,15 @@ class KMeansIsolationTree:
         self.PADDING = 1.0
     
     def fit(
-        self, 
-        Xs: npt.NDArray[np.floating[Any]], 
-        subsample_size: int | None = 256, 
+        self,
+        Xs: npt.NDArray[np.floating[Any]],
+        subsample_size: int | None = 256,
         contamination: float | None = 0.1
     ) -> None:
-        """Train the K-Means isolation tree on data.
-        
+        """
         Builds the tree structure by partitioning a subsample of the data using
         K-Means clustering, then calculates the anomaly threshold based on
         normality scores.
-        
         Args:
             Xs: Training data of shape (n_samples, n_features).
             subsample_size: Number of samples to use for building the tree.
@@ -299,9 +405,9 @@ class KMeansIsolationTree:
             contamination: Expected proportion of anomalies (between 0 and 1).
                 If None, no threshold is computed (used in ensemble training).
         """
-        self.feature_limits = []
-        for i in range(Xs.shape[1]):
-            self.feature_limits.append([np.min(Xs[:, i]) - self.PADDING, np.max(Xs[:, i]) + self.PADDING])
+        mins = np.min(Xs, axis=0) - self.PADDING
+        maxs = np.max(Xs, axis=0) + self.PADDING
+        self.feature_limits = [[float(mins[i]), float(maxs[i])] for i in range(len(mins))]
 
         self.root = KMeansIsolationTreeNode(
             depth=0,
@@ -314,7 +420,6 @@ class KMeansIsolationTree:
         else:
             Xs_train = Xs
 
-        # MAX_DEPTH = int(np.ceil(np.log2(Xs_train.shape[0])))
         MAX_DEPTH = 9
         self.root.partition_space(Xs_train, MAX_DEPTH)
 
@@ -322,45 +427,28 @@ class KMeansIsolationTree:
         if self.contamination is None:
             self.anomaly_threshold = 0.5
         else:
-            Xs_train_normality_scores = []
-            for i in range(Xs_train.shape[0]):
-                normality_score = self.root.get_normality_score(Xs_train[i])
-                Xs_train_normality_scores.append(normality_score)
-            Xs_train_normality_scores_arr = np.array(Xs_train_normality_scores)
-
+            # Vectorized threshold calculation
+            Xs_train_normality_scores_arr = self.root.get_normality_scores_batch(Xs_train)
             Xs_train_anomaly_scores = 1.0 - Xs_train_normality_scores_arr
             self.anomaly_threshold = float(np.quantile(Xs_train_anomaly_scores, 1.0 - self.contamination))
 
     def normality_scores(self, Xs: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.floating[Any]]:
-        """Compute normality scores for samples.
-        
+        """
         Normality scores are based on proximity to cluster centers at each level.
         Higher scores indicate more normal samples.
-        
         Args:
             Xs: Data samples of shape (n_samples, n_features).
-            
         Returns:
             Normality scores for each sample of shape (n_samples,).
         """
         assert self.root is not None
-        
-        normality_scores_list = []
-        for i in range(Xs.shape[0]):
-            normality_score = self.root.get_normality_score(Xs[i])
-            normality_scores_list.append(normality_score)
-            
-        normality_scores_arr = np.array(normality_scores_list)
-        return normality_scores_arr
+        return self.root.get_normality_scores_batch(Xs)
     
     def scores(self, Xs: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.floating[Any]]:
-        """Compute anomaly scores for samples.
-        
+        """
         Anomaly scores are derived from normality scores: anomaly = 1 - normality.
-        
         Args:
             Xs: Data samples of shape (n_samples, n_features).
-            
         Returns:
             Anomaly scores for each sample of shape (n_samples,).
         """
@@ -369,11 +457,9 @@ class KMeansIsolationTree:
         return anomaly_scores
     
     def predict(self, Xs: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.int_]:
-        """Predict anomaly labels for samples.
-        
+        """
         Args:
             Xs: Data samples of shape (n_samples, n_features).
-            
         Returns:
             Binary labels (0=normal, 1=anomaly) of shape (n_samples,).
         """
@@ -382,27 +468,17 @@ class KMeansIsolationTree:
         return predictions
     
     def get_path_lengths(self, Xs: npt.NDArray[np.floating[Any]]) -> npt.NDArray[np.floating[Any]]:
-        """Get path lengths for all samples.
-        
+        """
         Args:
             Xs: Data samples of shape (n_samples, n_features).
-            
         Returns:
             Path lengths for each sample of shape (n_samples,).
         """
         assert self.root is not None
-        
-        path_lengths = []
-        for i in range(Xs.shape[0]):
-            path_length = self.root.get_path_length(Xs[i])
-            path_lengths.append(path_length)
-
-        path_lengths_arr = np.array(path_lengths)
-        return path_lengths_arr
+        return self.root.get_path_lengths_batch(Xs)
 
     def plot_partition_space_2D(self) -> None:
-        """Visualize the 2D space partitioning created by this tree.
-        
+        """
         Shows the boundary box and all internal splits. Only works for 2D data.
         """
         assert self.feature_limits is not None
